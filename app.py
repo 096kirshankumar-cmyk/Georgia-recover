@@ -53,6 +53,36 @@ def ref_font():
 
 
 # --------------------------------------------------------------------------- #
+#  Persistent storage on the Railway volume (/volume) so jobs and their output
+#  files survive redeploys/restarts — not just page refreshes. Falls back to a
+#  local ./data dir when no volume is mounted (local dev / non-Railway).
+# --------------------------------------------------------------------------- #
+def _storage_dir():
+    for cand in (os.environ.get("RAILWAY_VOLUME_MOUNT_PATH"),
+                 os.environ.get("VOLUME_DIR"),
+                 "/volume"):
+        if cand:
+            try:
+                os.makedirs(cand, exist_ok=True)
+                probe = os.path.join(cand, ".wtest")
+                with open(probe, "w") as f:
+                    f.write("1")
+                os.remove(probe)
+                return cand
+            except Exception:
+                continue
+    d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+STORAGE = _storage_dir()
+OUTPUTS = os.path.join(STORAGE, "outputs")
+os.makedirs(OUTPUTS, exist_ok=True)
+STATE = os.path.join(STORAGE, "jobs.json")
+
+
+# --------------------------------------------------------------------------- #
 #  Job manager: each job is isolated (own temp dir, log, output), processed
 #  one-at-a-time by a single background worker. No cross-job shared state.
 # --------------------------------------------------------------------------- #
@@ -68,7 +98,8 @@ class Job:
         self.status = "queued"          # queued | processing | done | error
         self.logs = []                  # list of log lines
         self.lock = threading.Lock()
-        self.workdir = tempfile.mkdtemp(prefix="pdfjob_")
+        self.workdir = os.path.join(OUTPUTS, job_id)
+        os.makedirs(self.workdir, exist_ok=True)
         self.input_path = None
         self.output_path = None         # primary output (corrected pdf or text)
         self.result_name = None         # primary download filename
@@ -189,7 +220,72 @@ def _worker():
             except Exception as e:  # last-resort guard
                 job.status = "error"
                 job.error = str(e)
+            _save_state()
         _Q.task_done()
+
+
+_STATE_LOCK = threading.Lock()
+
+
+def _save_state():
+    """Persist job metadata to the volume so jobs survive redeploys."""
+    data = {"jobs": []}
+    with _STATE_LOCK:
+        for j in _JOBS.values():
+            data["jobs"].append({
+                "id": j.id,
+                "filename": j.filename,
+                "mode": j.mode,
+                "status": j.status,
+                "error": j.error,
+                "created": j.created,
+                "downloads": j.downloads,
+                "outputs": j.outputs,
+                "output_path": j.output_path,
+                "result_name": j.result_name,
+                "output_type": j.output_type,
+            })
+    try:
+        with open(STATE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def _load_state():
+    """Restore jobs (and their downloadable outputs) from the volume."""
+    if not os.path.exists(STATE):
+        return
+    try:
+        with open(STATE) as f:
+            data = json.load(f)
+    except Exception:
+        return
+    for s in data.get("jobs", []):
+        job_id = s.get("id")
+        if not job_id or job_id in _JOBS:
+            continue
+        j = Job(job_id, s.get("filename", "unknown.pdf"), s.get("mode", "corrected_pdf"))
+        j.created = s.get("created", time.time())
+        j.downloads = s.get("downloads", 0)
+        j.outputs = s.get("outputs", [])
+        j.output_path = s.get("output_path")
+        j.result_name = s.get("result_name")
+        j.output_type = s.get("output_type")
+        if j.outputs:
+            j.output_path = j.output_path or j.outputs[0].get("path")
+            j.result_name = j.result_name or j.outputs[0].get("name")
+            j.output_type = j.output_type or j.outputs[0].get("type")
+        if s.get("status") in ("done", "error"):
+            j.status = s["status"]
+            j.error = s.get("error")
+            j._log(f"Restored from storage — outputs still available ({j.status})")
+        else:
+            # an interrupted (queued/processing) job can't resume: mark it
+            j.status = "error"
+            j.error = "Interrupted by a server restart — please upload this PDF again."
+            j._log("Interrupted by server restart; please re-upload.")
+        _JOBS[job_id] = j
 
 
 threading.Thread(target=_worker, daemon=True).start()
@@ -201,7 +297,11 @@ def _create_job(filename, data, mode):
     job.bytes = data
     _JOBS[job_id] = job
     _Q.put(job_id)
+    _save_state()
     return job
+
+
+_load_state()
 
 
 # --------------------------------------------------------------------------- #
