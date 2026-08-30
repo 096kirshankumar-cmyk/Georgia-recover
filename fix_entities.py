@@ -95,13 +95,20 @@ def decode_literal_chars(body):
 
 
 def literal_body(ch):
-    """Return PDF-literal body bytes for an ASCII char, else None."""
-    code = ord(ch)
-    if code < 32 or code > 255:
+    """Return PDF-literal body bytes for a character, else None if unencodable.
+
+    Encodes via WinAnsi (cp1252) so bullets etc. are preserved, and escapes the
+    PDF-special bytes `(` `)` `\\`."""
+    try:
+        b = ch.encode('cp1252')
+    except UnicodeEncodeError:
         return None
-    if code in (0x28, 0x29, 0x5C):
-        return b'\\' + bytes([code])
-    return bytes([code])
+    out = bytearray()
+    for byte in b:
+        if byte in (0x28, 0x29, 0x5C):  # ( ) \
+            out.append(0x5C)
+        out.append(byte)
+    return bytes(out)
 
 
 def build_units(items, res, page):
@@ -192,9 +199,11 @@ def find_entity_spans(units):
 def rewrite_content(data, res, page):
     """Return new content bytes with entities replaced, or None if no change.
 
-    Replaces each entity's whole glyph byte-range (from the start of the `&`
-    literal to the end of the `;` literal, including all interleaved font
-    switches) with a single `(char)Tj` in the font active at the entity start.
+    Replaces each entity's glyphs with the real character, PRESERVING any
+    leading/trailing non-entity characters that share the same tokens (e.g. the
+    leading space in `( &)`) so no visible gap is introduced. It also consumes
+    the trailing text-show operator after the last entity literal so we never
+    emit a doubled `Tj`.
     """
     items = tokenize(data)
     units = build_units(items, res, page)
@@ -211,16 +220,34 @@ def rewrite_content(data, res, page):
         lb = literal_body(char)
         if lb is None:
             continue
-        start = items[toks[0]][2]
-        end = items[toks[-1]][3]
-        repl = b'(' + lb + b')Tj '
-        replacements.append((start, end, repl))
+        # chars in the covered tokens that are NOT part of the entity itself
+        preserve = []
+        first, last = toks[0], toks[-1]
+        for u in range(len(units)):
+            t = units[u][1]
+            if first <= t <= last:
+                if u0 <= u < u1:
+                    continue  # entity char, replaced
+                preserve.append(units[u][0])
+        repl_lit = ''.join(preserve) + char
+        # build literal body bytes
+        body = b''
+        for ch in repl_lit:
+            b = literal_body(ch)
+            if b is None:
+                break
+            body += b
+        else:
+            start = items[first][2]
+            end = items[last][3]
+            nxt = last + 1
+            if nxt < len(items) and items[nxt][0] == 'op' and items[nxt][1] in (b'Tj', b'TJ', b"'", b'"'):
+                end = items[nxt][3]
+            replacements.append((start, end, b'(' + body + b')Tj '))
     if not replacements:
         return None
-    # Apply from the last span backwards so earlier offsets stay valid.
     replacements.sort(key=lambda r: r[0])
     out = bytearray(data)
-    # build new by slicing (do from end to start)
     for start, end, repl in reversed(replacements):
         out[start:end] = repl
     return bytes(out)
