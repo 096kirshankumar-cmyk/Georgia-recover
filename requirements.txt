@@ -1,0 +1,9 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+pikepdf>=9.0
+pymupdf>=1.24
+pdfminer.six>=20231228
+fonttools>=4.47
+numpy>=1.26
+freetype-py>=2.4

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+ref_font/
+_subset_*.ttf
+recovered*.txt
+_ocr_*.png
+render_p1.png
