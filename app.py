@@ -402,7 +402,7 @@ function renderJobs(){
   $('grid').innerHTML=ids.length?ids.map(id=>{
     const j=jobs[id];
     let extra='';
-    if(j.status==='processing'&&!j.finished) extra=`<div class="progress"><div class="bar" style="width:60%"></div></div>`;
+    if(j.status==='processing') extra=`<div class="progress"><div class="bar" style="width:60%"></div></div>`;
     if(j.status==='done'&&j.outputs&&j.outputs.length){
       const btns=j.outputs.map(o=>{
         const label=o.type==='pdf'?'⬇ Download corrected PDF':'⬇ Download text';
@@ -457,6 +457,32 @@ function appendLog(lines){
 function toggleTerm(){ if(!termOpen){$('termwrap').style.display='block';termOpen=true;}
   else{$('termwrap').style.display='none';termOpen=false;} }
 function clearTerm(){const tb=$('termbody');tb.innerHTML=`<div id="termempty">Waiting for a job…</div>`;}
+
+/* ---- boot: reload existing jobs so a page refresh never loses them ---- */
+async function init(){
+  try{
+    const r=await fetch('/api/jobs');
+    const d=await r.json();
+    (d.jobs||[]).forEach(j=>jobs[j.id]=j);
+    renderJobs();
+    // auto-open the live log for the most recent unfinished job
+    const active=[...Object.values(jobs)]
+      .filter(j=>j.status==='queued'||j.status==='processing')
+      .sort((a,b)=>b.created-a.created);
+    if(active.length) stream(active[0].id, active[0].filename);
+  }catch(e){console.error('init failed',e);}
+}
+/* Poll fallback: keeps statuses/outputs fresh even if SSE is unavailable. */
+setInterval(async()=>{
+  const ids=Object.keys(jobs);
+  for(const id of ids){
+    if(jobs[id].status==='done'||jobs[id].status==='error') continue;
+    try{const r=await fetch('/api/jobs/'+id);if(r.ok)jobs[id]=await r.json();}
+    catch(e){}
+  }
+  renderJobs();
+},2500);
+init();
 </script>
 </body>
 </html>
