@@ -6,6 +6,7 @@ Deploy: Railway (Dockerfile) or any FastAPI host. Auto-deploy via GitHub Actions
 import io
 import os
 import tempfile
+import threading
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import PlainTextResponse, HTMLResponse, StreamingResponse
@@ -20,8 +21,19 @@ app.add_middleware(
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
-# Ensure the reference Georgia font exists (downloads if missing).
-REF = ensure_ref_font(os.environ.get("GEORGIA_FONT_PATH"))
+# Reference Georgia font is resolved lazily (downloaded on first request if missing)
+# so the app boots even if the download is slow or temporarily offline at startup.
+_FONT_PATH = os.environ.get("GEORGIA_FONT_PATH")
+_FONT_LOCK = threading.Lock()
+_REF = {"path": None}
+
+
+def ref_font():
+    """Return the reference font path, downloading once if necessary."""
+    with _FONT_LOCK:
+        if _REF["path"] is None:
+            _REF["path"] = ensure_ref_font(_FONT_PATH)
+        return _REF["path"]
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -54,7 +66,7 @@ def recover_text(file: UploadFile = File(...)):
         tmp.write(data)
         path = tmp.name
     try:
-        text, stats = recover(path, ref_font=REF, verbose=False)
+        text, stats = recover(path, ref_font=ref_font(), verbose=False)
     except Exception as e:
         raise HTTPException(500, f"Recovery failed: {e}")
     finally:
@@ -75,7 +87,7 @@ def correct_pdf_endpoint(file: UploadFile = File(...)):
         inpath = tmp.name
     outpath = tempfile.mktemp(suffix="_corrected.pdf")
     try:
-        correct_pdf(inpath, outpath, ref_font=REF, verbose=False)
+        correct_pdf(inpath, outpath, ref_font=ref_font(), verbose=False)
         with open(outpath, "rb") as f:
             payload = f.read()
     except Exception as e:
