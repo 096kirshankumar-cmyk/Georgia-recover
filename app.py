@@ -323,7 +323,7 @@ _INDEX_HTML = r"""<!DOCTYPE html>
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--text);
        font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;}
-  .wrap{max-width:1080px;margin:0 auto;padding:24px 20px 60px}
+  .wrap{max-width:1080px;margin:0 auto;padding:24px 20px 320px}
   header{display:flex;align-items:center;gap:14px;margin-bottom:22px}
   .logo{width:44px;height:44px;border-radius:12px;flex:none;
         background:linear-gradient(135deg,var(--accent),var(--accent2));
@@ -382,8 +382,10 @@ _INDEX_HTML = r"""<!DOCTYPE html>
   #termhead .tt{font-size:12px;font-weight:600;color:var(--accent)}
   #termhead .tt .live{color:var(--ok);animation:blink 1.2s infinite}
   @keyframes blink{50%{opacity:.3}}
-  #termbody{height:190px;overflow:auto;padding:10px 16px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  #termbody{height:150px;overflow:auto;padding:10px 16px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
         font-size:12px;line-height:1.6;white-space:pre-wrap;color:#cbd5e1}
+  #termbody.closed{height:0;padding:0}
+  #termind{display:inline-block;margin-left:8px;font-size:11px;color:var(--muted)}
   #termbody .log-line{display:block}
   #termbody .info{color:#7dd3fc}
   #termbody .ok{color:#34d399}
@@ -442,8 +444,11 @@ _INDEX_HTML = r"""<!DOCTYPE html>
 <!-- live log terminal pinned to the bottom -->
 <div id="termwrap">
   <div id="termhead" onclick="toggleTerm()">
-    <div class="tt"><span class="live">●</span> LIVE LOG&nbsp; <span id="termTitle">— select a job</span></div>
-    <button class="clearbtn" onclick="event.stopPropagation();clearTerm()">Clear</button>
+    <div class="tt"><span class="live">●</span> LIVE LOG&nbsp; <span id="termTitle">— select a job</span><span id="termind"></span></div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button class="clearbtn" onclick="event.stopPropagation();clearTerm()">Clear</button>
+      <button class="clearbtn" id="collapseBtn" onclick="event.stopPropagation();toggleTerm()">Hide ▾</button>
+    </div>
   </div>
   <div id="termbody"><div id="termempty">Waiting for a job to stream its log…</div></div>
 </div>
@@ -527,18 +532,37 @@ function fmtDate(t){return new Date(t*1000).toLocaleTimeString();}
 function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
 /* ---- live log (SSE) ---- */
+function openTerm(){
+  $('termwrap').style.display='block';
+  $('termbody').classList.remove('closed');
+  $('collapseBtn').textContent='Hide ▾';
+  $('termind').textContent='';
+  termOpen=true;
+}
+function toggleTerm(){
+  if(termOpen){
+    $('termbody').classList.add('closed');
+    $('collapseBtn').textContent='Show ▴';
+    $('termind').textContent='log hidden';
+    termOpen=false;
+  }else{
+    openTerm();
+  }
+}
 function stream(id, name){
   if(es)es.close();
   $('termTitle').textContent=' — '+name;
   $('termbody').innerHTML='';
   $('termempty').style.display='none';
-  $('termwrap').style.display='block'; termOpen=true;
+  openTerm();
   es=new EventSource('/api/jobs/'+id+'/stream');
   es.onmessage=ev=>{
     const d=JSON.parse(ev.data);
     if(d.logs&&d.logs.length) appendLog(d.logs);
-    if(d.status){jobs[id]=Object.assign(jobs[id]||{},d);renderJobs();}
-    if(d.final){es.close();es=null;refresh(id);}
+    // status transition -> re-fetch the full job (includes the outputs list)
+    // so the download button appears immediately even if the final SSE
+    // event is lost behind the proxy.
+    if(d.status){refresh(id);}
   };
   es.onerror=()=>{ if(es){es.close();es=null;refresh(id);} };
 }
@@ -554,8 +578,6 @@ function appendLog(lines){
   tb.appendChild(el);
   tb.scrollTop=tb.scrollHeight;
 }
-function toggleTerm(){ if(!termOpen){$('termwrap').style.display='block';termOpen=true;}
-  else{$('termwrap').style.display='none';termOpen=false;} }
 function clearTerm(){const tb=$('termbody');tb.innerHTML=`<div id="termempty">Waiting for a job…</div>`;}
 
 /* ---- boot: reload existing jobs so a page refresh never loses them ---- */
@@ -572,16 +594,24 @@ async function init(){
     if(active.length) stream(active[0].id, active[0].filename);
   }catch(e){console.error('init failed',e);}
 }
-/* Poll fallback: keeps statuses/outputs fresh even if SSE is unavailable. */
+/* Poll fallback: keeps statuses/outputs fresh even if SSE is unavailable.
+   Also refreshes done jobs so a missed SSE 'done' event can't leave a card
+   without its download button. */
+let _lastRefresh={};
 setInterval(async()=>{
   const ids=Object.keys(jobs);
+  const now=Date.now();
   for(const id of ids){
-    if(jobs[id].status==='done'||jobs[id].status==='error') continue;
-    try{const r=await fetch('/api/jobs/'+id);if(r.ok)jobs[id]=await r.json();}
-    catch(e){}
+    const j=jobs[id];
+    const isTerminal=(j.status==='done'||j.status==='error');
+    // active jobs: always refresh; terminal jobs: refresh once after finish
+    if(!isTerminal || _lastRefresh[id]===undefined){
+      try{const r=await fetch('/api/jobs/'+id);if(r.ok){jobs[id]=await r.json();_lastRefresh[id]=now;}}
+      catch(e){}
+    }
   }
   renderJobs();
-},2500);
+},2000);
 init();
 </script>
 </body>
