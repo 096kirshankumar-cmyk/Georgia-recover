@@ -51,6 +51,37 @@ REF_GEORGIA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
                            'ref_font', 'Georgia.TTF')
 
 
+def decode_literal_bytes(b):
+    """Decode a PDF literal-string body to its raw character-code bytes.
+
+    Resolves newline/carriage/tab/backspace/formfeed, escaped parens and
+    backslash, and up-to-3-digit octal escapes, returning the bytearray of
+    character codes (before any font encoding).
+    """
+    out = bytearray()
+    i = 0
+    while i < len(b):
+        c = b[i]
+        if c == 0x5c and i + 1 < len(b):  # backslash escape
+            n = b[i + 1]
+            if n in b'nrtbf':
+                out.append({ord('n'):10, ord('r'):13, ord('t'):9,
+                            ord('b'):8, ord('f'):12}[n])
+                i += 2
+            elif n == 0x28 or n == 0x29 or n == 0x5c:
+                out.append(n); i += 2
+            elif 0x30 <= n <= 0x37:
+                j = i + 1; v = 0; cnt = 0
+                while j < len(b) and cnt < 3 and 0x30 <= b[j] <= 0x37:
+                    v = v * 8 + (b[j] - 0x30); j += 1; cnt += 1
+                out.append(v); i = j
+            else:
+                out.append(n); i += 2
+        else:
+            out.append(c); i += 1
+    return bytes(out)
+
+
 def decode_literal(b):
     """Decode a PDF literal string (...) for WinAnsiEncoded simple fonts."""
     # strip surrounding parens handled by caller; here b is the raw paren-body bytes
@@ -247,8 +278,26 @@ class ContentInterpreter:
         return self.tm[4], self.tm[5]
 
     def _decode_bytes(self, literal):
-        # literal for simple fonts -> WinAnsi
+        # Simple TrueType Georgia subsets (PyPDF2 style): char codes shown via
+        # octal-escaped literal strings. Decode each byte through the font's
+        # code->char map (cmap -> glyph-outline match). Other simple fonts use
+        # WinAnsi.
+        if self.font is not None and self._is_truetype_georgia():
+            gmap = self.resolve(self.font, self._page)
+            if gmap:
+                # decode PDF escapes to char-code bytes, then map via cmap+glyph
+                return ''.join(gmap.get(b, '') for b in decode_literal_bytes(literal))
         return decode_literal(literal)
+
+    def _is_truetype_georgia(self):
+        try:
+            fo = self._page['/Resources']['/Font'].get(pikepdf.Name(self.font))
+            if fo is None:
+                return False
+            return (str(fo.get('/Subtype', '')) == '/TrueType'
+                    and 'Georgia' in str(fo.get('/BaseFont', '')))
+        except Exception:
+            return False
 
     def _advance(self, bytes_seq, hexmode=False):
         """Advance the text position by the shown glyphs' advance widths."""
@@ -339,6 +388,7 @@ class GIDResolver:
         self.ref_font = ref_font
         self.verbose = verbose
         self.map_cache = {}
+        self._code_cache = {}
         self.pdf = None
         chars = self._default_chars()
         self.lib = ReferenceLibrary(ref_font, chars=chars)
@@ -356,9 +406,13 @@ class GIDResolver:
 
     @staticmethod
     def _extract_font_bytes(font):
+        # Handles both Type0/CID fonts (FontFile2 under DescendantFonts'
+        # FontDescriptor) and simple TrueType fonts (FontFile2 directly under
+        # the font's own FontDescriptor).
         try:
-            df = font['/DescendantFonts'][0]
-            fd = df['/FontDescriptor']
+            fd = font.get('/FontDescriptor', None)
+            if fd is None:
+                fd = font['/DescendantFonts'][0]['/FontDescriptor']
             for k in ('/FontFile2', '/FontFile', '/FontFile3'):
                 if k in fd:
                     return fd[k].read_bytes()
@@ -373,8 +427,23 @@ class GIDResolver:
         except Exception:
             return False
 
+    def is_georgia_truetype_font(self, font):
+        try:
+            return (font.get('/Subtype', None) == Name('/TrueType')
+                    and 'Georgia' in str(font.get('/BaseFont', '')))
+        except Exception:
+            return False
+
     def map_for_font(self, font):
-        """Build gid->char map for a Georgia Type0 font object (subset-aware)."""
+        """Build a char map for a Georgia font object (subset-aware).
+
+        Type0/CID fonts -> {cid(gid): char} (Identity-H, so gid == cid).
+        Simple TrueType fonts -> {char_code: char}, derived from the embedded
+        font's cmap (char code -> glyph) plus glyph-outline matching (glyph ->
+        char).
+        """
+        if self.is_georgia_truetype_font(font):
+            return self.code_map_for_font(font)
         if not self.is_georgia_cid_font(font):
             return None
         raw = self._extract_font_bytes(font)
@@ -384,6 +453,49 @@ class GIDResolver:
         if key not in self.map_cache:
             self.map_cache[key] = self._build_map(raw, str(font.get('/BaseFont', 'cid')))
         return self.map_cache[key]
+
+    def code_map_for_font(self, font):
+        """Build {char_code: char} for a simple TrueType Georgia font.
+
+        Uses the embedded font's cmap to translate a character code to its
+        glyph, then glyph-outline matching to translate that glyph to a real
+        Unicode character.
+        """
+        raw = self._extract_font_bytes(font)
+        if raw is None:
+            return None
+        key = hashlib.sha256(raw).hexdigest()
+        if key not in self._code_cache:
+            gmap = self._build_map(raw, str(font.get('/BaseFont', 'tt')))  # gid->char
+            code2char = {}
+            try:
+                from fontTools.ttLib import TTFont
+                import os as _os
+                tmp = '_subset_codemap.ttf'
+                with open(tmp, 'wb') as fh:
+                    fh.write(raw)
+                tf = TTFont(tmp)
+                _os.remove(tmp)
+                go = tf.getGlyphOrder()
+                tables = tf['cmap'].tables
+                best = None
+                for t in tables:
+                    if t.platformID == 1 and t.platEncID == 0:
+                        best = t
+                        break
+                if best is None and tables:
+                    best = tables[0]
+                if best is not None:
+                    for code, gname in best.cmap.items():
+                        if gname in go:
+                            gid = go.index(gname)
+                            ch = gmap.get(gid, '')
+                            if ch:
+                                code2char[code] = ch
+            except Exception:
+                code2char = {}
+            self._code_cache[key] = code2char
+        return self._code_cache[key]
 
     def widths_for_font(self, font):
         """Return {code_or_gid: width_in_1000_units} for a font object.
@@ -413,7 +525,8 @@ class GIDResolver:
         try:
             fonts = page['/Resources']['/Font']
             f = fonts.get(pikepdf.Name(font_name))
-            if f is None or not self.is_georgia_cid_font(f):
+            if f is None or not (self.is_georgia_cid_font(f)
+                                 or self.is_georgia_truetype_font(f)):
                 return None
             return self._extract_font_bytes(f)
         except Exception:

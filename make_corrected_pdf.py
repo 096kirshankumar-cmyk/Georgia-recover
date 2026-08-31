@@ -129,7 +129,7 @@ def correct_pdf(input_path, output_path, ref_font=None, add_cmap=True, verbose=T
             gen = f.objgen if hasattr(f, 'objgen') else id(f)
             if gen not in seen:
                 seen.add(gen)
-                if res.is_georgia_cid_font(f):
+                if res.is_georgia_cid_font(f) or res.is_georgia_truetype_font(f):
                     font_objs.append(f)
 
     for f in font_objs:
@@ -138,7 +138,12 @@ def correct_pdf(input_path, output_path, ref_font=None, add_cmap=True, verbose=T
             if verbose:
                 print('  skip (no map):', f.get('/BaseFont'))
             continue
-        if add_cmap:
+        is_tt = res.is_georgia_truetype_font(f)
+        if add_cmap and not is_tt:
+            # CID fonts: also inject a cmap into the embedded font. For simple
+            # TrueType fonts we leave the embedded font's cmap untouched (it
+            # already maps char code -> glyph correctly; rendering is identical)
+            # and only fix the /ToUnicode text map below.
             raw = res._extract_font_bytes(f)
             if raw is not None:
                 try:
@@ -151,7 +156,8 @@ def correct_pdf(input_path, output_path, ref_font=None, add_cmap=True, verbose=T
                 except Exception as e:
                     if verbose:
                         print('  cmap add failed:', e)
-        # Write correct /ToUnicode
+        # Write correct /ToUnicode (CID -> Unicode, or char code -> Unicode for
+        # simple TrueType fonts).
         cmap_data = build_unicmap(gmap).encode('ascii')
         f['/ToUnicode'] = pikepdf.Stream(src, cmap_data)
         if verbose:
