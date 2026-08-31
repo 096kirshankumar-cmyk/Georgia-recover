@@ -64,6 +64,12 @@ def tokenize(data):
             j = i
             while j < n and data[j] not in b' \t\r\n\x0c()<>[]{}/%':
                 j += 1
+            # A bare closing delimiter (e.g. ')' in a formula page) falls into
+            # this branch, but the stop-set would make the inner loop not run,
+            # leaving i/j unchanged -> infinite loop. Always advance at least
+            # one byte so the tokenizer can never stall.
+            if j == i:
+                j = i + 1
             items.append(('op', data[i:j], i, j)); i = j
     return items
 
